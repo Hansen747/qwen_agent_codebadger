@@ -1,0 +1,11 @@
+name: codebadger
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+    - qwen-agent>=0.0.15
+    - mcp>=1.0.0
+    - python-dotenv
