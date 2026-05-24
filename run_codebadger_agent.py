@@ -23,9 +23,12 @@ Prerequisites:
 import argparse
 import json
 import os
+import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 os.environ.setdefault("QWEN_AGENT_MAX_LLM_CALL_PER_RUN", "25")
 
@@ -39,6 +42,81 @@ TEST_PROJECTS_DIR = str(Path(__file__).parent.parent / "pecker-3.0-out" / "proje
 RESULTS_DIR = str(Path(__file__).parent / "results")
 
 CODEBADGER_MCP_URL = "http://localhost:4242/mcp"
+
+
+class TokenTracker:
+    """Tracks token usage across multiple OpenAI API calls."""
+
+    def __init__(self):
+        self._lock = Lock()
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.call_count = 0
+
+    def add(self, usage):
+        with self._lock:
+            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+            self.total_tokens += getattr(usage, "total_tokens", 0) or 0
+            self.call_count += 1
+
+    def reset(self):
+        with self._lock:
+            self.prompt_tokens = 0
+            self.completion_tokens = 0
+            self.total_tokens = 0
+            self.call_count = 0
+
+    def to_dict(self):
+        with self._lock:
+            return {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+                "total_tokens": self.total_tokens,
+                "llm_call_count": self.call_count,
+            }
+
+
+_token_tracker = TokenTracker()
+
+
+def _patch_openai_for_token_tracking():
+    """Monkey-patch the OAI LLM class to capture token usage from responses."""
+    from qwen_agent.llm.oai import TextChatAtOAI
+
+    original_init = TextChatAtOAI.__init__
+
+    def patched_init(self, cfg=None):
+        original_init(self, cfg)
+        original_chat_create = self._chat_complete_create
+
+        def tracked_chat_create(*args, **kwargs):
+            stream = kwargs.get("stream", False)
+            if stream:
+                kwargs.setdefault("stream_options", {"include_usage": True})
+            response = original_chat_create(*args, **kwargs)
+            if not stream:
+                if hasattr(response, "usage") and response.usage:
+                    _token_tracker.add(response.usage)
+            else:
+                response = _wrap_stream_for_usage(response)
+            return response
+
+        self._chat_complete_create = tracked_chat_create
+
+    TextChatAtOAI.__init__ = patched_init
+
+
+def _wrap_stream_for_usage(stream_response):
+    """Wrap a streaming response to capture usage from the final chunk."""
+    for chunk in stream_response:
+        if hasattr(chunk, "usage") and chunk.usage:
+            _token_tracker.add(chunk.usage)
+        yield chunk
+
+
+_patch_openai_for_token_tracking()
 
 SYSTEM_PROMPT = """You are a security researcher performing repository-level vulnerability detection.
 You have access to CodeBadger, a static analysis tool that provides Code Property Graph (CPG) based analysis capabilities.
@@ -185,6 +263,72 @@ def wait_for_cpg(codebadger_url: str, project_path: str, language: str = "java",
     return asyncio.run(_generate_and_wait())
 
 
+def extract_vulnerabilities(response_text: str) -> dict:
+    """Extract vulnerability detection results from the agent's response."""
+    vuln_found = False
+    vuln_paths = []
+
+    if not response_text:
+        return {"detected": False, "vulnerabilities": []}
+
+    text_lower = response_text.lower()
+
+    has_vuln_indicators = any(kw in text_lower for kw in [
+        "vulnerability", "cve-", "cwe-", "injection", "rce",
+        "remote code execution", "path traversal", "ssrf",
+        "deserialization", "critical", "high severity",
+        "sql injection", "xss", "command injection",
+    ])
+    has_no_vuln_indicators = any(kw in text_lower for kw in [
+        "no vulnerabilities found", "no significant vulnerabilities",
+        "no critical vulnerabilities", "no issues found",
+        "could not identify any vulnerabilities",
+    ])
+
+    if has_vuln_indicators and not has_no_vuln_indicators:
+        vuln_found = True
+
+    # Extract file paths mentioned as vulnerable
+    file_patterns = re.findall(
+        r'(?:affected|vulnerable|file|path|location)[:\s]*[`"\']*([A-Za-z0-9_/\\.\-]+\.java)[`"\']*',
+        response_text, re.IGNORECASE
+    )
+    # Also match patterns like "src/main/java/..."
+    java_paths = re.findall(
+        r'((?:src/)?(?:main|test)/(?:java/)?[A-Za-z0-9_/]+\.java)',
+        response_text
+    )
+    # Patterns like com.package.ClassName
+    class_patterns = re.findall(
+        r'((?:[a-z][a-z0-9]*\.)+[A-Z][A-Za-z0-9]*)',
+        response_text
+    )
+
+    all_paths = list(dict.fromkeys(file_patterns + java_paths))
+    vuln_classes = list(dict.fromkeys(class_patterns[:20]))
+
+    # Extract CWE/CVE IDs
+    cwe_ids = list(dict.fromkeys(re.findall(r'CWE-\d+', response_text, re.IGNORECASE)))
+    cve_ids = list(dict.fromkeys(re.findall(r'CVE-\d{4}-\d+', response_text, re.IGNORECASE)))
+
+    # Extract severity
+    severities = re.findall(r'\b(Critical|High|Medium|Low)\b', response_text, re.IGNORECASE)
+    max_severity = "Unknown"
+    severity_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+    for s in severities:
+        if severity_order.get(s.lower(), 0) > severity_order.get(max_severity.lower(), 0):
+            max_severity = s.capitalize()
+
+    return {
+        "detected": vuln_found,
+        "max_severity": max_severity if vuln_found else "N/A",
+        "cwe_ids": cwe_ids,
+        "cve_ids": cve_ids,
+        "vulnerable_files": all_paths,
+        "vulnerable_classes": vuln_classes,
+    }
+
+
 def run_detection(agent: Assistant, project_path: str, project_name: str,
                   codebadger_url: str, llm_cfg: dict = None) -> dict:
     """Run vulnerability detection on a single project."""
@@ -194,6 +338,7 @@ def run_detection(agent: Assistant, project_path: str, project_name: str,
     print(f"[*] Path: {project_path}")
     print(f"{'='*70}\n")
 
+    _token_tracker.reset()
     start_time = time.time()
 
     # Phase 1: Generate CPG and wait (done in Python, not by the LLM)
@@ -201,10 +346,13 @@ def run_detection(agent: Assistant, project_path: str, project_name: str,
         codebase_hash = wait_for_cpg(codebadger_url, project_path)
     except Exception as e:
         print(f"[!] CPG generation failed: {e}")
+        elapsed = round(time.time() - start_time, 2)
         return {
             "project": project_name,
             "path": project_path,
-            "elapsed_seconds": round(time.time() - start_time, 2),
+            "elapsed_seconds": elapsed,
+            "token_usage": _token_tracker.to_dict(),
+            "vulnerabilities": {"detected": False},
             "response": "",
             "error": f"CPG generation failed: {e}",
             "full_conversation": [],
@@ -257,7 +405,6 @@ def run_detection(agent: Assistant, project_path: str, project_name: str,
         last_response = None
         for chunk in llm.chat(messages=summary_messages, stream=False):
             last_response = chunk
-        # last_response is a dict like {'role': 'assistant', 'content': '...'}
         if last_response and isinstance(last_response, dict):
             content = last_response.get("content", "")
             if isinstance(content, str) and content.strip():
@@ -271,17 +418,27 @@ def run_detection(agent: Assistant, project_path: str, project_name: str,
     response_text = "\n".join(all_text_parts)
     elapsed = time.time() - start_time
 
+    vulnerabilities = extract_vulnerabilities(response_text)
+    token_usage = _token_tracker.to_dict()
+
     result = {
         "project": project_name,
         "path": project_path,
         "codebase_hash": codebase_hash,
         "elapsed_seconds": round(elapsed, 2),
+        "token_usage": token_usage,
+        "vulnerabilities": vulnerabilities,
         "response": response_text,
         "full_conversation": final_response,
     }
 
     print(f"\n[*] Completed in {elapsed:.1f}s")
-    print(f"[*] Response length: {len(response_text)} chars")
+    print(f"[*] Tokens: {token_usage['total_tokens']} total "
+          f"({token_usage['prompt_tokens']} prompt + {token_usage['completion_tokens']} completion) "
+          f"in {token_usage['llm_call_count']} calls")
+    print(f"[*] Vulnerability detected: {vulnerabilities['detected']}")
+    if vulnerabilities.get('vulnerable_files'):
+        print(f"[*] Vulnerable files: {vulnerabilities['vulnerable_files'][:5]}")
 
     return result
 
@@ -303,6 +460,8 @@ def main():
     parser = argparse.ArgumentParser(description="CodeBadger Vulnerability Detection Agent")
     parser.add_argument("--project", type=str, help="Project directory name to analyze")
     parser.add_argument("--all", action="store_true", help="Analyze all test projects")
+    parser.add_argument("--task-id", type=str, default=None,
+                        help="Task ID for organizing results (default: auto-generated)")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-32B",
                         help="Model name (default: Qwen/Qwen3-32B)")
     parser.add_argument("--model-server", type=str, default="http://localhost:8000/v1",
@@ -312,15 +471,26 @@ def main():
     parser.add_argument("--codebadger-url", type=str, default=CODEBADGER_MCP_URL,
                         help="CodeBadger MCP server URL")
     parser.add_argument("--output-dir", type=str, default=RESULTS_DIR,
-                        help="Output directory for results")
+                        help="Base output directory for results")
     parser.add_argument("--projects-dir", type=str, default=TEST_PROJECTS_DIR,
                         help="Directory containing test projects")
 
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Generate task_id if not provided
+    if args.task_id:
+        task_id = args.task_id
+    else:
+        model_short = args.model.split("/")[-1].lower()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        task_id = f"{model_short}_{timestamp}"
+
+    task_dir = os.path.join(args.output_dir, task_id)
+    os.makedirs(task_dir, exist_ok=True)
 
     llm_cfg = get_llm_config(args.model, args.model_server, args.api_key)
+    print(f"[*] Task ID: {task_id}")
+    print(f"[*] Results dir: {task_dir}")
     print(f"[*] LLM config: model={args.model}, server={args.model_server}")
     print(f"[*] CodeBadger MCP: {args.codebadger_url}")
 
@@ -345,36 +515,82 @@ def main():
             result = run_detection(agent, project_path, project_name, args.codebadger_url, llm_cfg)
             all_results.append(result)
 
-            # Save individual result
-            result_file = os.path.join(args.output_dir, f"{project_name}.json")
-            with open(result_file, "w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2)
-            print(f"[*] Saved: {result_file}")
+            # Save per-project results in results/{task_id}/{project_name}/
+            project_result_dir = os.path.join(task_dir, project_name)
+            os.makedirs(project_result_dir, exist_ok=True)
+
+            # Save metrics (lightweight, no conversation log)
+            metrics = {
+                "project": project_name,
+                "elapsed_seconds": result["elapsed_seconds"],
+                "token_usage": result["token_usage"],
+                "vulnerabilities": result["vulnerabilities"],
+            }
+            metrics_file = os.path.join(project_result_dir, "metrics.json")
+            with open(metrics_file, "w", encoding="utf-8") as f:
+                json.dump(metrics, f, ensure_ascii=False, indent=2)
+
+            # Save full report text
+            report_file = os.path.join(project_result_dir, "report.md")
+            with open(report_file, "w", encoding="utf-8") as f:
+                f.write(f"# Vulnerability Report: {project_name}\n\n")
+                f.write(result.get("response", "") or "(no report generated)")
+
+            # Save full conversation log (for debugging)
+            conv_file = os.path.join(project_result_dir, "conversation.json")
+            with open(conv_file, "w", encoding="utf-8") as f:
+                json.dump(result["full_conversation"], f, ensure_ascii=False, indent=2)
+
+            print(f"[*] Saved: {project_result_dir}/")
 
         except Exception as e:
             print(f"[!] Error analyzing {project_name}: {e}")
             all_results.append({
                 "project": project_name,
                 "error": str(e),
+                "elapsed_seconds": 0,
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "llm_call_count": 0},
+                "vulnerabilities": {"detected": False},
             })
 
-    # Save summary
-    summary_file = os.path.join(args.output_dir, "summary.json")
+    # Save task-level summary
+    total_tokens = sum(r.get("token_usage", {}).get("total_tokens", 0) for r in all_results)
+    total_time = sum(r.get("elapsed_seconds", 0) for r in all_results)
+    detected_count = sum(1 for r in all_results if r.get("vulnerabilities", {}).get("detected", False))
+
     summary = {
+        "task_id": task_id,
+        "timestamp": datetime.now().isoformat(),
         "model": args.model,
         "model_server": args.model_server,
         "codebadger_url": args.codebadger_url,
         "total_projects": len(projects),
         "completed": len([r for r in all_results if "error" not in r]),
         "failed": len([r for r in all_results if "error" in r]),
-        "results": all_results,
+        "detected_vulnerabilities": detected_count,
+        "total_elapsed_seconds": round(total_time, 2),
+        "total_tokens": total_tokens,
+        "per_project": [
+            {
+                "project": r["project"],
+                "elapsed_seconds": r.get("elapsed_seconds", 0),
+                "token_usage": r.get("token_usage", {}),
+                "vulnerabilities": r.get("vulnerabilities", {}),
+                "error": r.get("error"),
+            }
+            for r in all_results
+        ],
     }
+    summary_file = os.path.join(task_dir, "summary.json")
     with open(summary_file, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"\n{'='*70}")
+    print(f"[*] Task: {task_id}")
     print(f"[*] Done. {summary['completed']}/{summary['total_projects']} projects analyzed.")
-    print(f"[*] Results saved to: {args.output_dir}")
+    print(f"[*] Vulnerabilities detected: {detected_count}/{summary['completed']}")
+    print(f"[*] Total time: {total_time:.1f}s | Total tokens: {total_tokens}")
+    print(f"[*] Results saved to: {task_dir}")
     print(f"{'='*70}")
 
 
